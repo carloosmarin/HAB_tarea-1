@@ -1,3 +1,8 @@
+# Tarea 1: Análisis Funcional de COX4I2, MT-ND1 y MT-ATP6
+
+Este repositorio contiene un script en Python que realiza un análisis funcional de tres genes mitocondriales humanos (COX4I2, ND1 y ATP6).  
+El análisis incluye conversión de identificadores, obtención de anotaciones, y enriquecimiento funcional mediante MyGene, GOATOOLS, Enrichr y STRINGdb.  
+Las salidas se almacenan en la carpeta `/results/`.  
 
 # Tarea 1: Análisis Funcional 
 
