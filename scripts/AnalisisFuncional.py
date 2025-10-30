@@ -82,15 +82,24 @@ def ensure_dir(path: str):
 
 
 def read_gene_list(input_path: str) -> List[str]:
+    """
+    Lee el archivo de genes de entrada. Admite formato con comas (COX4I2, ND1, ATP6)
+    o formato por líneas (uno por línea).
+    """
     genes = []
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read().strip()
-        # Separar por coma o salto de línea
-        for part in text.replace(",", "\n").split():
-            g = part.strip()
+
+        # Si el archivo contiene comas, las sustituye por saltos de línea
+        text = text.replace(",", "\n")
+
+        # Ahora divide el texto por líneas y limpia los espacios
+        for line in text.splitlines():
+            g = line.strip()
             if g and not g.startswith("#"):
                 genes.append(g)
     return genes
+
 
 
 def save_df(df: pd.DataFrame, path: str):
