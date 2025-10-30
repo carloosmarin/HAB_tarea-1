@@ -67,6 +67,33 @@ from goatools.associations import read_gaf
 from goatools.go_enrichment import GOEnrichmentStudy
 
 
+def fix_human_mito_aliases(symbols: list[str]) -> list[str]:
+    """
+    Corrige alias frecuentes de genes mitocondriales humanos a los símbolos HGNC oficiales.
+    Ej.: ND1 -> MT-ND1, ATP6 -> MT-ATP6, etc.
+    """
+    mito_map = {
+        "ND1": "MT-ND1",
+        "ND2": "MT-ND2",
+        "ND3": "MT-ND3",
+        "ND4": "MT-ND4",
+        "ND4L": "MT-ND4L",
+        "ND5": "MT-ND5",
+        "ND6": "MT-ND6",
+        "ATP6": "MT-ATP6",
+        "ATP8": "MT-ATP8",
+        "COX1": "MT-CO1",
+        "COX2": "MT-CO2",
+        "COX3": "MT-CO3",
+        "CYTB": "MT-CYB",
+    }
+    fixed = []
+    for s in symbols:
+        s_clean = s.strip().upper().replace(",", "")
+        fixed.append(mito_map.get(s_clean, s_clean))
+    return fixed
+
+
 # ------------------------ Utilidades generales ------------------------ #
 
 def setup_logging():
@@ -463,6 +490,10 @@ def main():
     # 1) Leer genes de entrada
     genes_input = read_gene_list(args.input)
     logging.info(f"Genes de entrada: {genes_input}")
+    # Normalizar alias mitocondriales (humano)
+    genes_input = fix_human_mito_aliases(genes_input)
+    logging.info(f"Genes normalizados: {genes_input}")
+
 
     # 2) MyGene: mapping
     df_map = mygene_mapping(genes_input, species=args.species)
