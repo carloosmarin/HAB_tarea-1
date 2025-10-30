@@ -84,8 +84,10 @@ def ensure_dir(path: str):
 def read_gene_list(input_path: str) -> List[str]:
     genes = []
     with open(input_path, "r", encoding="utf-8") as f:
-        for line in f:
-            g = line.strip()
+        text = f.read().strip()
+        # Separar por coma o salto de línea
+        for part in text.replace(",", "\n").split():
+            g = part.strip()
             if g and not g.startswith("#"):
                 genes.append(g)
     return genes
