@@ -1,1 +1,11 @@
-.DS_Store
+# Archivos descargados por el script
+data/goa_human.gaf
+data/goa_human.gaf.gz
+data/go-basic.obo
+
+# Resultados generados
+results/
+*.tsv
+*.csv
+*.xlsx
+
