@@ -17,22 +17,26 @@ Métodos y bases de datos utilizados (solo los vistos en clase/conversación):
     * Asociaciones: goa_human.gaf (UniProtKB→GO; descarga oficial)
   Estadística: Test exacto de Fisher + corrección múltiple BH (FDR).
 - Enrichr (API) para ORA contra bibliotecas amplias (GO Biological Process, Reactome, KEGG_2019_Human).
-  Devuelve p-value, Z-score y combined score (útil para priorizar).
-- STRINGdb (API) para ORA de GO (y otras categorías) con respaldo de red de PPIs de STRING.
+- STRINGdb (API) para ORA con respaldo de red de PPIs de STRING.
 
 Flujo:
-1) Leer genes de entrada (símbolos).
-2) Normalizar/validar (humano) y mapear a UniProt/Ensembl/Entrez con mygene.
+1) Leer genes de entrada (símbolos o IDs).
+2) Normalizar/validar y mapear a UniProt/Ensembl/Entrez con mygene.
 3) (Opcional) Descargar resúmenes de NCBI Gene con Biopython/Entrez.
 4) Descargar go-basic.obo y goa_human.gaf; construir universo (background) y asociaciones (UniProt→GO).
 5) ORA de GO con GOATOOLS (propagate_counts=True; FDR BH).
-6) ORA con Enrichr (API) en bibliotecas seleccionadas (por defecto: GO BP y Reactome).
+6) ORA con Enrichr (API) en bibliotecas seleccionadas (por defecto: GO BP, Reactome, KEGG).
 7) ORA con STRING (API) y guardar resultados.
-8) Guardar todos los outputs en 'results/'.
+8) Guardar outputs en 'results/' y limpieza de archivos pesados.
 
-CLI:
-    python scripts/tu_script.py --input data/genes_input.txt --outdir results \
-        --email_topt TU_EMAIL@DOMINIO --string_id TU_EMAIL@DOMINIO
+CLI (ejemplo PowerShell):
+    python scripts/AnalisisFuncional.py `
+      --input data/genes_input.txt `
+      --outdir results `
+      --email_topt TU_EMAIL@DOMINIO `
+      --string_id TU_EMAIL@DOMINIO `
+      --input_id_type auto `
+      --go_bg_size 2000
 
 Requisitos (requirements.txt sugerido):
     mygene
@@ -52,14 +56,15 @@ import gzip
 import shutil
 import logging
 import json
-from typing import List, Dict, Any, Tuple
+import re
+import random
+from time import sleep
+from typing import List, Tuple
 
 import requests
 import pandas as pd
 import mygene
-
-# Biopython (Entrez) es opcional: solo si se pasa --email_topt
-from Bio import Entrez
+from Bio import Entrez  # Biopython (opcional)
 
 # GOATOOLS
 from goatools import obo_parser
@@ -67,7 +72,40 @@ from goatools.associations import read_gaf
 from goatools.go_enrichment import GOEnrichmentStudy
 
 
-def fix_human_mito_aliases(symbols: list[str]) -> list[str]:
+# ------------------------ Helpers de logging / sistema ------------------------ #
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S"
+    )
+
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+# ------------------------ Detección / normalización de IDs ------------------------ #
+
+ENSEMBL_RE = re.compile(r"^ENSG\d{11}$", re.IGNORECASE)
+UNIPROT_RE = re.compile(r"^[A-NR-Z0-9]{6,10}$")  # heurística simple
+ENTREZ_RE = re.compile(r"^\d+$")
+
+
+def detect_id_type(s: str) -> str:
+    s = s.strip()
+    if ENSEMBL_RE.match(s):
+        return "ensembl"
+    if ENTREZ_RE.match(s):
+        return "entrez"
+    # Si parece uniprot y está en mayúsculas
+    if UNIPROT_RE.match(s) and s.upper() == s:
+        return "uniprot"
+    return "symbol"
+
+
+def fix_human_mito_aliases(symbols: List[str]) -> List[str]:
     """
     Corrige alias frecuentes de genes mitocondriales humanos a los símbolos HGNC oficiales.
     Ej.: ND1 -> MT-ND1, ATP6 -> MT-ATP6, etc.
@@ -94,20 +132,6 @@ def fix_human_mito_aliases(symbols: list[str]) -> list[str]:
     return fixed
 
 
-# ------------------------ Utilidades generales ------------------------ #
-
-def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S"
-    )
-
-
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
 def read_gene_list(input_path: str) -> List[str]:
     """
     Lee el archivo de genes de entrada. Admite formato con comas (COX4I2, ND1, ATP6)
@@ -116,17 +140,14 @@ def read_gene_list(input_path: str) -> List[str]:
     genes = []
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read().strip()
-
-        # Si el archivo contiene comas, las sustituye por saltos de línea
         text = text.replace(",", "\n")
-
-        # Ahora divide el texto por líneas y limpia los espacios
         for line in text.splitlines():
             g = line.strip()
             if g and not g.startswith("#"):
                 genes.append(g)
+    if not genes:
+        raise ValueError(f"El archivo de entrada '{input_path}' no contiene genes válidos.")
     return genes
-
 
 
 def save_df(df: pd.DataFrame, path: str):
@@ -137,41 +158,92 @@ def save_df(df: pd.DataFrame, path: str):
     logging.info(f"Guardado: {path}")
 
 
+# ------------------------ Red robusta (reintentos/backoff) ------------------------ #
+
+def robust_request(method, url, *, max_retries=3, backoff=2.0, timeout=60, **kwargs):
+    """
+    Envuelve requests.get/post con reintentos exponenciales y logging claro.
+    method: 'get' o 'post'
+    """
+    func = requests.get if method.lower() == "get" else requests.post
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = func(url, timeout=timeout, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            logging.warning(f"[NET] {method.upper()} {url} falló (intento {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                sleep(backoff ** attempt)
+    raise last_err
+
+
 # ------------------------ Paso 1: MyGene (normalización / mapping) ------------------------ #
 
-def mygene_mapping(genes: List[str], species: str = "human") -> pd.DataFrame:
+def mygene_mapping(genes: List[str],
+                   species: str = "human",
+                   input_id_type: str = "auto",
+                   output_cols: List[str] | None = None) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Normaliza símbolos humanos y obtiene múltiples IDs (UniProt, Ensembl, Entrez).
-    - Usa scopes amplios ('symbol,alias') y species='human' para resolver alias (ND1 -> MT-ND1).
-    - Unifica posibles múltiples UniProt (Swiss-Prot y/o TrEMBL).
+    Normaliza y convierte IDs con MyGene:
+    - Admite entrada: symbol|entrez|ensembl|uniprot|auto
+    - Devuelve DataFrame con columnas de salida y lista de no mapeados.
     """
-    mg = mygene.MyGeneInfo()
-    logging.info(f"Consultando MyGene para {len(genes)} genes...")
-    res = mg.querymany(
-        genes,
-        scopes="symbol,alias",
-        fields="symbol,name,entrezgene,ensembl.gene,uniprot",
-        species=species,
-        as_dataframe=False
-    )
+    if output_cols is None:
+        output_cols = ["symbol_official", "gene_name", "entrez", "ensembl_gene", "uniprot_ids"]
 
-    rows = []
+    scopes_map = {
+        "symbol": "symbol,alias",
+        "entrez": "entrezgene",
+        "ensembl": "ensembl.gene",
+        "uniprot": "uniprot",
+    }
+
+    if input_id_type == "auto":
+        detected = {detect_id_type(g) for g in genes}
+        if len(detected) == 1:
+            scopes = scopes_map[list(detected)[0]]
+        else:
+            scopes = "symbol,alias,entrezgene,ensembl.gene,uniprot"
+    else:
+        scopes = scopes_map.get(input_id_type, "symbol,alias")
+
+    mg = mygene.MyGeneInfo()
+    logging.info(f"Consultando MyGene para {len(genes)} genes... (scopes='{scopes}')")
+    try:
+        res = mg.querymany(
+            genes,
+            scopes=scopes,
+            fields="symbol,name,entrezgene,ensembl.gene,uniprot",
+            species=species,
+            as_dataframe=False
+        )
+    except Exception as e:
+        raise RuntimeError(f"Fallo consultando MyGene: {e}")
+
+    rows, missing = [], []
     for r in res:
+        if r.get('notfound'):
+            missing.append(r.get('query'))
+            continue
+
         q = r.get('query')
         sym = r.get('symbol')
         name = r.get('name')
         entrez = r.get('entrezgene')
+
         ensg = None
         ensembl_field = r.get('ensembl')
         if isinstance(ensembl_field, dict):
             ensg = ensembl_field.get('gene')
         elif isinstance(ensembl_field, list) and ensembl_field:
-            # tomar el primero si hay varios
             first = ensembl_field[0]
             if isinstance(first, dict):
                 ensg = first.get('gene')
 
-        # UniProt puede ser str, dict (Swiss-Prot/TrEMBL) o lista
+        # UniProt puede ser str, dict o lista
         uniprot_vals = []
         up = r.get('uniprot')
         if isinstance(up, str):
@@ -198,8 +270,17 @@ def mygene_mapping(genes: List[str], species: str = "human") -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows)
-    logging.info("MyGene mapping completado.")
-    return df
+    # Asegura columnas solicitadas
+    for c in ["input"] + output_cols:
+        if c not in df.columns:
+            df[c] = ""
+
+    if missing:
+        logging.warning(f"MyGene: {len(missing)} no mapeados: {missing}")
+    else:
+        logging.info("MyGene mapping completado (sin faltantes).")
+
+    return df, missing
 
 
 # ------------------------ Paso 2: Biopython/Entrez (resúmenes opcionales) ------------------------ #
@@ -226,7 +307,6 @@ def fetch_ncbi_summaries(symbols: List[str], email: str) -> str:
                 time.sleep(0.3)
                 continue
             gid = ids[0]
-            # El formato de 'gb' para gene es texto; también se podría usar docsum/summary.
             handle = Entrez.efetch(db="gene", id=gid, rettype="gene_table", retmode="text")
             txt = handle.read()
             handle.close()
@@ -248,8 +328,7 @@ def download_file(url: str, dest_path: str):
         logging.info(f"Ya existe: {dest_path} (se omite descarga)")
         return
     logging.info(f"Descargando: {url}")
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
+    r = robust_request("get", url, timeout=120)
     with open(dest_path, "wb") as f:
         f.write(r.content)
     logging.info(f"Guardado: {dest_path}")
@@ -298,9 +377,9 @@ def build_background_from_gaf(gaf_path: str) -> List[str]:
     return bg_list
 
 
-def run_goatools_enrichment(study_uniprot: List[str], obo_path: str, gaf_path: str, out_path: str):
+def run_goatools_enrichment(study_uniprot: List[str], obo_path: str, gaf_path: str, out_path: str, bg_size: int):
     """
-    Ejecuta ORA con GOATOOLS (Fisher + BH FDR), propagate_counts=True, y guarda resultados.
+    Ejecuta ORA con GOATOOLS (Fisher + BH FDR), propagate_counts=True, y guarda resultados significativos.
     """
     if not study_uniprot:
         logging.warning("Lista de estudio vacía para GOATOOLS; se omite.")
@@ -314,8 +393,18 @@ def run_goatools_enrichment(study_uniprot: List[str], obo_path: str, gaf_path: s
     logging.info("Cargando asociaciones (GAF)...")
     gene2go = read_gaf(gaf_path)
 
-    # Universo
-    background = build_background_from_gaf(gaf_path)
+    # Universo (background) reducido
+    background_full = build_background_from_gaf(gaf_path)
+
+    random.seed(42)
+    background = random.sample(background_full, min(bg_size, len(background_full)))
+
+    # Aseguramos que los genes de estudio estén incluidos
+    for gene in study_uniprot:
+        if gene not in background:
+            background.append(gene)
+
+    logging.info(f"Usando background reducido de {len(background)} genes (de {len(background_full)} totales).")
 
     # Ejecutar estudio
     logging.info("Ejecutando GOEnrichmentStudy (propagate_counts=True, FDR BH)...")
@@ -330,14 +419,24 @@ def run_goatools_enrichment(study_uniprot: List[str], obo_path: str, gaf_path: s
 
     results = go_study.run_study(study_uniprot)
 
-    # Convertir a DataFrame
+    # Filtrar resultados significativos (FDR < 0.05)
+    significant = [r for r in results if getattr(r, "p_fdr_bh", 1.0) < 0.05]
+
+    if not significant:
+        logging.info("No se encontraron términos GO significativos.")
+        # No guardamos archivo vacío; el usuario verá el warning de save_df si se quisiera escribir.
+        return
+
+    logging.info(f"Se encontraron {len(significant)} términos GO significativos (FDR < 0.05).")
+
+    # Convertir los resultados significativos a DataFrame compacto
     rows = []
-    for r in results:
+    for r in significant:
         rows.append({
             "GO_ID": r.GO,
             "name": r.name,
-            "namespace": r.NS,  # BP/MF/CC
-            "enrichment": r.enrichment,  # e/p
+            "namespace": r.NS,
+            "enrichment": r.enrichment,
             "p_uncorrected": r.p_uncorrected,
             "p_fdr_bh": getattr(r, "p_fdr_bh", None),
             "study_count": r.study_count,
@@ -346,7 +445,6 @@ def run_goatools_enrichment(study_uniprot: List[str], obo_path: str, gaf_path: s
             "pop_n": r.ratio_in_pop[1] if r.ratio_in_pop else None
         })
     df = pd.DataFrame(rows)
-    # Orden sugerido: por FDR y luego por p crudo
     if not df.empty:
         df.sort_values(by=["p_fdr_bh", "p_uncorrected"], inplace=True, na_position="last")
     save_df(df, out_path)
@@ -356,6 +454,7 @@ def run_goatools_enrichment(study_uniprot: List[str], obo_path: str, gaf_path: s
 
 ENRICHR_ADD_URL = "https://maayanlab.cloud/Enrichr/addList"
 ENRICHR_ENRICH_URL = "https://maayanlab.cloud/Enrichr/enrich"
+
 
 def enrichr_enrichment(symbols: List[str],
                        libraries: List[str],
@@ -374,25 +473,15 @@ def enrichr_enrichment(symbols: List[str],
         'description': (None, 'Functional analysis gene list')
     }
     logging.info("Subiendo lista a Enrichr...")
-    r = requests.post(ENRICHR_ADD_URL, files=files, timeout=60)
-    if r.status_code != 200:
-        logging.error(f"Error al subir lista a Enrichr: {r.status_code} {r.text}")
-        return
+    r = robust_request("post", ENRICHR_ADD_URL, files=files, timeout=60)
     user_list_id = r.json().get("userListId")
     logging.info(f"Enrichr userListId={user_list_id}")
 
     for lib in libraries:
         params = {"userListId": user_list_id, "backgroundType": lib}
         logging.info(f"Consultando Enrichr: {lib}")
-        r = requests.get(ENRICHR_ENRICH_URL, params=params, timeout=60)
-        if r.status_code != 200:
-            logging.error(f"Error en Enrichr ({lib}): {r.status_code} {r.text}")
-            continue
+        r = robust_request("get", ENRICHR_ENRICH_URL, params=params, timeout=60)
         data = r.json()
-        # data[lib] es una lista de filas (lista posicional)
-        # Índices más habituales (según docs de Enrichr):
-        # 0: rank, 1: term_name, 2: pvalue, 3: zscore, 4: combined_score,
-        # 5: overlapping_genes, 6: adjusted_pvalue (FDR), etc. (puede variar)
         rows = []
         for rec in data.get(lib, []):
             term_name = rec[1] if len(rec) > 1 else ""
@@ -420,6 +509,8 @@ def enrichr_enrichment(symbols: List[str],
 # ------------------------ Paso 5: STRING (API) ------------------------ #
 
 STRING_API_BASE = "https://version-11-5.string-db.org/api"
+
+
 def string_enrichment(symbols: List[str], species: int, caller_identity: str, out_path: str):
     """
     Ejecuta el endpoint 'enrichment' de STRING v11.5 con una lista de símbolos humanos.
@@ -437,10 +528,8 @@ def string_enrichment(symbols: List[str], species: int, caller_identity: str, ou
         "caller_identity": caller_identity or "functional_analysis_script"
     }
     logging.info("Consultando STRING (enrichment)...")
-    r = requests.post(url, data=params, timeout=120)
-    if r.status_code != 200:
-        logging.error(f"Error STRING enrichment: {r.status_code} {r.text}")
-        return
+    r = robust_request("post", url, data=params, timeout=120)
+
     try:
         data = r.json()
     except Exception:
@@ -469,7 +558,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Tarea 1: Análisis funcional (COX4I2, ND1, ATP6) con MyGene, GOATOOLS, Enrichr y STRING."
     )
-    p.add_argument("--input", required=True, help="Ruta del archivo de genes de entrada (uno por línea).")
+    p.add_argument("--input", required=True, help="Ruta del archivo de genes de entrada (con comas o por líneas).")
     p.add_argument("--outdir", required=True, help="Directorio de salida para resultados.")
     p.add_argument("--data_dir", default="data", help="Directorio para recursos GO (obo/gaf).")
     p.add_argument("--species", default="human", help="Especie para MyGene (por defecto: human).")
@@ -478,6 +567,13 @@ def parse_args():
     p.add_argument("--string_id", default="", help="Caller identity para STRING (email/ID).")
     p.add_argument("--enrichr_libs", default="GO_Biological_Process_2023,Reactome_2022,KEGG_2019_Human",
                    help="Lista de bibliotecas Enrichr separadas por coma.")
+    p.add_argument("--input_id_type", choices=["auto", "symbol", "entrez", "ensembl", "uniprot"],
+                   default="auto",
+                   help="Tipo de ID de entrada (auto|symbol|entrez|ensembl|uniprot).")
+    p.add_argument("--output_id_cols", default="symbol_official,entrez,ensembl_gene,uniprot_ids",
+                   help="Columnas de ID a asegurar en el mapeo (coma).")
+    p.add_argument("--go_bg_size", type=int, default=2000,
+                   help="Tamaño del background aleatorio para GOATOOLS (por defecto 2000).")
     return p.parse_args()
 
 
@@ -490,14 +586,26 @@ def main():
     # 1) Leer genes de entrada
     genes_input = read_gene_list(args.input)
     logging.info(f"Genes de entrada: {genes_input}")
-    # Normalizar alias mitocondriales (humano)
-    genes_input = fix_human_mito_aliases(genes_input)
+    # Normalizar alias mitocondriales (humano) si el input es simbólico/auto
+    if args.input_id_type in ("auto", "symbol"):
+        genes_input = fix_human_mito_aliases(genes_input)
     logging.info(f"Genes normalizados: {genes_input}")
 
-
-    # 2) MyGene: mapping
-    df_map = mygene_mapping(genes_input, species=args.species)
+    # 2) MyGene: mapping con detección/selección de ID de entrada
+    output_cols = [c.strip() for c in args.output_id_cols.split(",") if c.strip()]
+    df_map, missing = mygene_mapping(
+        genes_input,
+        species=args.species,
+        input_id_type=args.input_id_type,
+        output_cols=output_cols
+    )
     save_df(df_map, os.path.join(args.outdir, "id_mapping.tsv"))
+
+    if missing:
+        missing_path = os.path.join(args.outdir, "id_unmapped.txt")
+        with open(missing_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(missing) + "\n")
+        logging.warning(f"Guardado reporte de no mapeados: {missing_path}")
 
     # Obtener símbolos oficiales (para Enrichr/STRING)
     symbols_official = [s for s in df_map["symbol_official"].dropna().astype(str).tolist() if s]
@@ -509,6 +617,10 @@ def main():
     study_uniprot = sorted(set(uniprot_pool))
     logging.info(f"Símbolos oficiales (para Enrichr/STRING): {symbols_official}")
     logging.info(f"UniProt para GOATOOLS: {study_uniprot}")
+
+    if not symbols_official:
+        logging.error("No se obtuvieron símbolos oficiales tras el mapeo. Revisa el tipo de ID de entrada o los nombres.")
+        sys.exit(2)
 
     # 3) (Opcional) Resúmenes NCBI Gene
     if args.email_topt:
@@ -523,7 +635,7 @@ def main():
     # 4) GOATOOLS: descargar recursos y ejecutar ORA
     obo_path, gaf_path = ensure_go_resources(args.data_dir)
     goatools_out = os.path.join(args.outdir, "goatools_enrichment.tsv")
-    run_goatools_enrichment(study_uniprot, obo_path, gaf_path, goatools_out)
+    run_goatools_enrichment(study_uniprot, obo_path, gaf_path, goatools_out, bg_size=args.go_bg_size)
 
     # 5) Enrichr (ORA)
     enrichr_libs = [x.strip() for x in args.enrichr_libs.split(",") if x.strip()]
@@ -532,6 +644,18 @@ def main():
     # 6) STRING (ORA)
     string_out = os.path.join(args.outdir, "string_enrichment.tsv")
     string_enrichment(symbols_official, args.taxid, args.string_id, string_out)
+
+    # 7) Limpieza: eliminar archivos pesados intermedios
+    try:
+        for file_to_remove in [
+            os.path.join(args.data_dir, "goa_human.gaf"),
+            os.path.join(args.data_dir, "goa_human.gaf.gz")
+        ]:
+            if os.path.exists(file_to_remove):
+                os.remove(file_to_remove)
+                logging.info(f"Archivo eliminado para optimizar espacio: {file_to_remove}")
+    except Exception as e:
+        logging.warning(f"No se pudo eliminar archivo intermedio: {e}")
 
     logging.info("Análisis funcional completado ✅")
 

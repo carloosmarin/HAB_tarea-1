@@ -55,4 +55,3 @@ mygene
 biopython
 goatools
 ```
-Los resúmenes obtenidos desde NCBI Gene confirman que los tres genes analizados —COX4I2, MT-ND1 y MT-ATP6— están implicados en la cadena de transporte electrónico mitocondrial y en la fosforilación oxidativa. COX4I2, de origen nuclear, codifica una subunidad del complejo IV, mientras que MT-ND1 y MT-ATP6, codificados por el ADN mitocondrial, forman parte de los complejos I y V respectivamente. Estas funciones coinciden con los términos y rutas enriquecidas obtenidas en los análisis GO, KEGG y STRING, validando la coherencia biológica del análisis funcional.
